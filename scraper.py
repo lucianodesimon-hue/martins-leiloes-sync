@@ -23,23 +23,23 @@ from bs4 import BeautifulSoup
 FONTE = "https://martinsleiloes.com.br"
 TIMEOUT = 20
 
-# Imagens stock por categoria — usadas quando o card da Martins só tem logo
-# da carteira (TJMG, Suzano, etc) ou está vazio. Mesmas URLs CloudFront usadas
-# em index.php (categorias da home), pra manter consistência visual.
+import os
+WORKER_URL = os.environ.get("WORKER_URL", "").rstrip("/")
+WORKER_KEY = os.environ.get("WORKER_KEY", "")
+
 CATEGORIA_FALLBACK_IMG = {
     "veiculos":   "https://d3r4ngrkezrhn6.cloudfront.net/public/bomvalorjudicial/fotos/veiculos/327x244/suv_mmc_pajero_tr4_flex_preto-156124-1.jpg",
     "maquinas":   "https://d3r4ngrkezrhn6.cloudfront.net/public/cba/banner_leilao/34797_17785264021.jpg",
     "imoveis":    "https://d3r4ngrkezrhn6.cloudfront.net/public/resale/fotos/imoveis/327x244/casa-sao-paulo-131490-6.jpg",
     "industrial": "https://d3r4ngrkezrhn6.cloudfront.net/public/bomvalorjudicial/fotos/imoveis/327x244/galpao_industrial_tres_coracoes-591874-7.jpg",
     "sucatas":    "https://d3r4ngrkezrhn6.cloudfront.net/public/suzano/fotos/equipamentos/327x244/sucata_industrial-097536-9.jpg",
-    "tecnologia": "",  # SVG inline (handled by card-leilao.php placeholder)
+    "tecnologia": "",
     "animais":    "",
     "outros":     "",
 }
 
 
 def is_logo_ou_vazio(src: str) -> bool:
-    """True se a URL é só logo da carteira/banco (não foto real do leilão)."""
     if not src:
         return True
     s = src.lower()
@@ -52,170 +52,106 @@ def is_logo_ou_vazio(src: str) -> bool:
         or s.endswith("/logo.jpg")
     )
 
-# Headers de Chrome real — replicam o que browser envia. Necessário pra bypassar WAF.
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,*/*;q=0.8"
-    ),
-    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Cache-Control": "no-cache",
-    "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,*/*;q=0.8",
+    "Accept-Language": "pt-BR,pt;q=0.9",
 }
 
-
 def log(msg: str) -> None:
-    """Loga em stderr pra não atrapalhar o JSON no stdout."""
     print(msg, file=sys.stderr, flush=True)
 
 
 def fetch(url: str) -> Optional[str]:
-    """GET com headers de browser. Retorna HTML ou None."""
+    if WORKER_URL and WORKER_KEY:
+        proxy = f"{WORKER_URL}/?url={requests.utils.quote(url, safe='')}&key={WORKER_KEY}"
+        log(f"  → via worker: {url}")
+        try:
+            r = requests.get(proxy, timeout=30)
+            if r.status_code == 200 and r.text:
+                log(f"  ✓ {url} → HTTP 200 ({len(r.text)} bytes) [via worker]")
+                return r.text
+            log(f"  ✗ {url} → worker HTTP {r.status_code}")
+        except requests.RequestException as e:
+            log(f"  ✗ {url} → worker erro: {e}")
+        return None
     try:
-        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
+        r = requests.get(url, headers=HEADERS, timeout=20)
         if r.status_code == 200 and r.text:
             log(f"  ✓ {url} → HTTP 200 ({len(r.text)} bytes)")
             return r.text
         log(f"  ✗ {url} → HTTP {r.status_code} (tamanho {len(r.text)} bytes)")
-        return None
     except requests.RequestException as e:
         log(f"  ✗ {url} → erro: {e}")
-        return None
+    return None
 
 
 def sem_acento(s: str) -> str:
-    """Remove acentos pra comparações sem ambiguidade."""
     nfkd = unicodedata.normalize("NFKD", s)
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
-
 def categoria_da_url(href_e_titulo: str) -> str:
-    """Mesma lógica do scraper.php — categoria a partir do texto."""
     t = sem_acento(href_e_titulo.lower())
-
-    if "/imoveis/" in t:
-        return "imoveis"
-    if (
-        "imovei" in t
-        or "apartamento" in t
-        or re.search(r"\b(casa|casas)\b", t)
-        or "galpao" in t
-        or "terreno" in t
-        or "hotel-fazenda" in t
-        or "fazenda" in t
-        or "sitio" in t
-        or "chacara" in t
-    ):
-        return "imoveis"
-    if "sucata" in t or "residuo" in t or "reciclav" in t:
-        return "sucatas"
-    if "industrial" in t or "usina" in t or "fabrica" in t:
-        return "industrial"
-    if (
-        "tecnolog" in t
-        or "eletronic" in t
-        or "informatic" in t
-        or "servidor" in t
-    ):
-        return "tecnologia"
-    if (
-        "animais" in t
-        or "animal" in t
-        or "gado" in t
-        or "bovino" in t
-        or "equino" in t
-    ):
-        return "animais"
-    if (
-        "/bens-diversos/" in t
-        or "maquina" in t
-        or "caminh" in t
-        or "trator" in t
-        or "empilhad" in t
-        or "linha-amarela" in t
-        or "linha amarela" in t
-        or "escavadeira" in t
-        or "retro" in t
-    ):
-        return "maquinas"
-    if (
-        "/veiculos/" in t
-        or "veicul" in t
-        or "pajero" in t
-        or "carreta" in t
-        or "randon" in t
-        or "mitsubishi" in t
-        or "fiduciar" in t
-    ):
-        return "veiculos"
+    if "/imoveis/" in t: return "imoveis"
+    if ("imovei" in t or "apartamento" in t or re.search(r"\b(casa|casas)\b", t) or "galpao" in t or "terreno" in t or "hotel-fazenda" in t or "fazenda" in t or "sitio" in t or "chacara" in t): return "imoveis"
+    if "sucata" in t or "residuo" in t or "reciclav" in t: return "sucatas"
+    if "industrial" in t or "usina" in t or "fabrica" in t: return "industrial"
+    if "tecnolog" in t or "eletronic" in t or "informatic" in t or "servidor" in t: return "tecnologia"
+    if "animais" in t or "animal" in t or "gado" in t or "bovino" in t or "equino" in t: return "animais"
+    if ("/bens-diversos/" in t or "maquina" in t or "caminh" in t or "trator" in t or "empilhad" in t or "linha-amarela" in t or "linha amarela" in t or "escavadeira" in t or "retro" in t): return "maquinas"
+    if ("/veiculos/" in t or "veicul" in t or "pajero" in t or "carreta" in t or "randon" in t or "mitsubishi" in t or "fiduciar" in t): return "veiculos"
     return "outros"
 
-
 def slug_from_href(href: str) -> str:
-    """Último segmento do path como slug."""
     path = href.split("?")[0].rstrip("/")
     return path.split("/")[-1] or href.replace("/", "-")
-
 
 def rx_int(s: str, pattern: str) -> Optional[int]:
     m = re.search(pattern, s)
     return int(m.group(1)) if m else None
 
 
-def parse_evento_card(card, source_for_cat: str = "") -> Optional[dict[str, Any]]:
-    """Extrai um leilão de um <a class='card-home link-leilao'> (ou similar)."""
+def parse_card_generico(card, destaque: bool = False) -> Optional[dict[str, Any]]:
     href = card.get("href", "")
-    if not href:
+    if not href or not href.startswith("/"):
         return None
-    if not href.startswith("/"):
-        if not href.startswith(FONTE):
-            return None
-        href = href[len(FONTE):]
-
     texto = re.sub(r"\s+", " ", card.get_text(" ", strip=True))
-
-    id_origem = rx_int(texto, r"ID:\s*(\d+)")
-    if not id_origem:
-        # tenta extrair do final da URL (-12345)
-        id_origem = rx_int(href, r"-(\d{4,7})(?:/|$)")
+    id_origem = rx_int(texto, r"ID:\s*(\d+)") or rx_int(href, r"-(\d{4,7})(?:/|$)")
     if not id_origem:
         return None
-
+    # titulo: tenta status-leilao (destaques), depois titulo/card-title, depois h2/h3
     titulo = ""
-    titulo_node = card.find(class_=re.compile("titulo|card-title"))
-    if titulo_node:
-        titulo = titulo_node.get_text(strip=True)
+    for q in [{"parn": "class_", "val": "status-leilao"}, {"parn": "class_", "val": re.compile("titulo|card-title")}]:
+        node = card.find(**{"parn": q["val"]})if False else card.find(attrs={"class": q["val"]} if q["parn"] == "class_" else None
+        if node:
+            titulo = node.get_text(strip=True)
+            break
     if not titulo:
-        titulo_node = card.find(["h2", "h3"])
-        if titulo_node:
-            titulo = titulo_node.get_text(strip=True)
+        node = card.find(["h2", "h3"])
+        if node: titulo = node.get_text(strip=True)
     if not titulo:
         titulo = texto[:80]
-
+    # imagem: primeiro background-image do .carousel-item (destaques), depois <img banner_leilao>
     img = ""
-    img_node = card.find("img", src=re.compile("banner_leilao"))
-    if not img_node:
-        img_node = card.find("img", src=re.compile("cloudfront"))
-    if not img_node:
-        img_node = card.find("img")
-    if img_node:
-        img = img_node.get("src", "")
+    fotos = card.find_all(class_=re.compile(r"carousel-item.*fotos"))
+    for f in fotos:
+        style = f.get("style", "") or ""
+        m = re.search(r"url\(([^)]+)\)", style)
+        if m:
+            u = m.group(1).strip().strip("'\"")
+            if "banner_leilao" in u or "/fotos/" in u:
+                img = u
+                break
+    if not img:
+        inode = card.find("img", src=re.compile("banner_leilao")) or card.find("img", src=re.compile(r"/fotos/")) or card.find("img")
+        if inode: img = inode.get("src", "")
 
-    lotes_qtd = rx_int(texto, r"(\d+)\s+Lotes?")
+    categoria = categoria_da_url(titulo + " " + href)
+    if is_logo_ou_vazio(img):
+        img = CATEGORIA_FALLBACK_IMG.get(categoria, "")
+
     status = "agendado"
-    if re.search(r"ABERTO|EM PREG", texto, re.I):
+    if re.search(r"ABERTO PARA LANCES|ABERTO|EM PREG", texto, re.I):
         status = "aberto"
     elif re.search(r"ENCERRADO", texto, re.I):
         status = "encerrado"
@@ -224,21 +160,15 @@ def parse_evento_card(card, source_for_cat: str = "") -> Optional[dict[str, Any]
     m = re.search(r"Encerramento.*?(\d{2}/\d{2}/\d{4})\s*(\d{2}:\d{2})?", texto)
     if m:
         try:
-            fim_dt = datetime.strptime(
-                f"{m.group(1)} {m.group(2) or '18:00'}", "%d/%m/%Y %H:%M"
-            )
-            fim_str = fim_dt.strftime("%Y-%m-%d %H:%M:%S")
+            dd = datetime.strptime(f"{m.group(1)} {m.group(2) or '18:00'}", "%d/%m/%Y %H:%M")
+            fim_str = dd.strftime("%Y-%m-%d %H:%M:%S")
         except ValueError:
             pass
 
-    cat_source = source_for_cat or (titulo + " " + href)
-    categoria = categoria_da_url(cat_source)
-
-    # Se imagem é só logo/vazia, usa stock da categoria pra não ficar feio no card
-    if is_logo_ou_vazio(img):
-        img = CATEGORIA_FALLBACK_IMG.get(categoria, "")
-
+    lotes_qtd = rx_int(texto, r"(\d+)\s+Lotes?")
+    # inicio 24h atrás pra evitar bug timezone
     agora = datetime.now()
+    inicio = (agora - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
     fim_default = (agora + timedelta(days=15)).strftime("%Y-%m-%d %H:%M:%S")
 
     return {
@@ -249,93 +179,89 @@ def parse_evento_card(card, source_for_cat: str = "") -> Optional[dict[str, Any]
         "subcategoria": "",
         "cidade": "",
         "uf": "",
-        "lance_inicial": 0,
-        "lance_atual": 0,
-        "avaliacao": 0,
-        "desconto": 0,
-        "inicio": agora.strftime("%Y-%m-%d %H:%M:%S"),
+        "lance_inicial": 0, "lance_atual": 0, "avaliacao": 0, "desconto": 0,
+        "inicio": inicio,
         "fim": fim_str or fim_default,
         "tipo": "judicial" if "judic" in titulo.lower() else "extrajudicial",
         "imagem": img,
         "edital_url": "#",
         "lance_url": FONTE + href,
-        "descricao": f"{titulo}. Leilão conduzido pela Martins Leilões. "
-        + (f"{lotes_qtd} lotes disponíveis." if lotes_qtd else ""),
-        "destaque": True,
+        "descricao": f"{titulo}. Leilão conduzido pela Martins Leilões." + (f" {lotes_qtd} lotes disponíveis." if lotes_qtd else ""),
+        "destaque": destaque,
+        "status_origem": status,
         "lotes_qtd": lotes_qtd,
         "origem_url": FONTE + href,
     }
 
 
-def coletar_eventos_home() -> list[dict[str, Any]]:
-    log(f"Coletando home: {FONTE}/")
+def coletar_destaques() -> list[dict[str, Any]]:
+    log(f"Coletando destaques: {FONTE}/")
     html = fetch(FONTE + "/")
-    if not html:
-        return []
+    if not html: return []
     soup = BeautifulSoup(html, "lxml")
-
-    cards = soup.find_all("a", class_=lambda c: c and "card-home" in c and "link-leilao" in c)
-    log(f"  {len(cards)} cards encontrados na home")
-
+    cards = soup.select(".destaques-row .destaque-item a.leilao-container")
+    log(f"  {len(cards)} cards de destaque encontrados")
     eventos = []
     vistos = set()
     for card in cards:
-        evt = parse_evento_card(card)
-        if evt and evt["id_origem"] not in vistos:
-            eventos.append(evt)
-            vistos.add(evt["id_origem"])
+        e = parse_card_generico(card, destaque=True)
+        if e and e["id_origem"] not in vistos:
+            eventos.append(e)
+            vistos.add(e["id_origem"])
     return eventos
 
 
-def coletar_busca_categoria(slug: str) -> list[dict[str, Any]]:
-    url = f"{FONTE}/busca/categoriaProduto/{slug}"
-    log(f"Coletando categoria '{slug}': {url}")
-    html = fetch(url)
-    if not html:
-        return []
+def coletar_proximos() -> list[dict[str, Any]]:
+    log(f"Coletando próximos leilões: {FONTE}/")
+    html = fetch(FONTE + "/")
+    if not html: return []
     soup = BeautifulSoup(html, "lxml")
-
-    # tenta seletores em ordem de especificidade
-    selectors = [
-        {"name": "a", "class_": lambda c: c and "card-home" in c and "link-leilao" in c},
-        {"name": "a", "class_": lambda c: c and "card" in c, "href": re.compile(r"/leilao-|/evento")},
-        {"name": "a", "href": re.compile(r"/leilao-")},
-    ]
-    cards = []
-    for sel in selectors:
-        cards = soup.find_all(**sel)
-        if cards:
-            break
-    log(f"  {len(cards)} cards encontrados")
-
+    cards = soup.find_all("a", class_=lambda c: c and "card-home" in c and "link-leilao" in c)
+    log(f"  {len(cards)} cards 'próximos' encontrados")
     eventos = []
     vistos = set()
     for card in cards:
-        # força categoria pelo slug do path
-        evt = parse_evento_card(card)
-        if evt and evt["id_origem"] not in vistos:
-            evt["categoria"] = slug
-            evt["destaque"] = False
-            eventos.append(evt)
-            vistos.add(evt["id_origem"])
+        e = parse_card_generico(card, destaque=False)
+        if e and e["id_origem"] not in vistos:
+            eventos.append(e)
+            vistos.add(e["id_origem"])
+    return eventos
+
+
+def coletar_categoria(slug: str) -> list[dict[str, Any]]:
+    url = f"{FONTE}/busca/categoriaProduto/{slug}"
+    log(f"Coletando categoria '{slug}': {url}")
+    html = fetch(url)
+    if not html: return []
+    soup = BeautifulSoup(html, "lxml")
+    cards = soup.select("a.leilao-container, a.card-home.link-leilao, a[href^='/leilao-']")
+    log(f"  {len(cards)} cards encontrados")
+    eventos = []
+    vistos = set()
+    for card in cards:
+        e = parse_card_generico(card)
+        if e and e["id_origem"] not in vistos:
+            e["categoria"] = slug
+            eventos.append(e)
+            vistos.add(e["id_origem"])
     return eventos
 
 
 def sincronizar() -> list[dict[str, Any]]:
-    """Coleta home + 4 categorias extras, dedup por id_origem."""
-    eventos = coletar_eventos_home()
+    eventos = coletar_destaques()
     vistos = {e["id_origem"] for e in eventos}
-
+    for e in coletar_proximos():
+        if e["id_origem"] not in vistos:
+            eventos.append(e)
+            vistos.add(e["id_origem"])
     for slug in ("industrial", "tecnologia", "animais", "sucatas"):
         try:
-            extras = coletar_busca_categoria(slug)
-            for e in extras:
+            for e in coletar_categoria(slug):
                 if e["id_origem"] not in vistos:
                     eventos.append(e)
                     vistos.add(e["id_origem"])
         except Exception as err:
             log(f"  ✗ falha em {slug}: {err}")
-
     return eventos
 
 
@@ -343,22 +269,17 @@ def main() -> int:
     log(f"=== Sync Bomvalor — {datetime.now().isoformat()} ===")
     eventos = sincronizar()
     log(f"\nTotal: {len(eventos)} leilões")
-
     if not eventos:
-        log("ERRO: zero leilões coletados — WAF da Martins pode estar bloqueando o IP do runner.")
+        log("ERRO: zero leilões coletados.")
         return 1
-
-    # Resumo por categoria pra log
     from collections import Counter
     cats = Counter(e["categoria"] for e in eventos)
     log("\nDistribuição:")
     for c, n in cats.most_common():
         log(f"  {c}: {n}")
-
-    # Saída: JSON no stdout (workflow redireciona pra arquivo)
     print(json.dumps(eventos, indent=2, ensure_ascii=False))
     return 0
 
-
 if __name__ == "__main__":
     sys.exit(main())
+
