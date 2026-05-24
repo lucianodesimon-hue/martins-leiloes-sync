@@ -23,6 +23,35 @@ from bs4 import BeautifulSoup
 FONTE = "https://martinsleiloes.com.br"
 TIMEOUT = 20
 
+# Imagens stock por categoria — usadas quando o card da Martins só tem logo
+# da carteira (TJMG, Suzano, etc) ou está vazio. Mesmas URLs CloudFront usadas
+# em index.php (categorias da home), pra manter consistência visual.
+CATEGORIA_FALLBACK_IMG = {
+    "veiculos":   "https://d3r4ngrkezrhn6.cloudfront.net/public/bomvalorjudicial/fotos/veiculos/327x244/suv_mmc_pajero_tr4_flex_preto-156124-1.jpg",
+    "maquinas":   "https://d3r4ngrkezrhn6.cloudfront.net/public/cba/banner_leilao/34797_17785264021.jpg",
+    "imoveis":    "https://d3r4ngrkezrhn6.cloudfront.net/public/resale/fotos/imoveis/327x244/casa-sao-paulo-131490-6.jpg",
+    "industrial": "https://d3r4ngrkezrhn6.cloudfront.net/public/bomvalorjudicial/fotos/imoveis/327x244/galpao_industrial_tres_coracoes-591874-7.jpg",
+    "sucatas":    "https://d3r4ngrkezrhn6.cloudfront.net/public/suzano/fotos/equipamentos/327x244/sucata_industrial-097536-9.jpg",
+    "tecnologia": "",  # SVG inline (handled by card-leilao.php placeholder)
+    "animais":    "",
+    "outros":     "",
+}
+
+
+def is_logo_ou_vazio(src: str) -> bool:
+    """True se a URL é só logo da carteira/banco (não foto real do leilão)."""
+    if not src:
+        return True
+    s = src.lower()
+    return (
+        "/logo" in s
+        or "tipo-leilao" in s
+        or "/layout/" in s
+        or "logo-header" in s
+        or s.endswith("/logo.png")
+        or s.endswith("/logo.jpg")
+    )
+
 # Headers de Chrome real — replicam o que browser envia. Necessário pra bypassar WAF.
 HEADERS = {
     "User-Agent": (
@@ -204,6 +233,10 @@ def parse_evento_card(card, source_for_cat: str = "") -> Optional[dict[str, Any]
 
     cat_source = source_for_cat or (titulo + " " + href)
     categoria = categoria_da_url(cat_source)
+
+    # Se imagem é só logo/vazia, usa stock da categoria pra não ficar feio no card
+    if is_logo_ou_vazio(img):
+        img = CATEGORIA_FALLBACK_IMG.get(categoria, "")
 
     agora = datetime.now()
     fim_default = (agora + timedelta(days=15)).strftime("%Y-%m-%d %H:%M:%S")
