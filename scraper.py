@@ -1,16 +1,8 @@
 #!/usr/bin/env python3
-"""
-Scraper Martins Leilões / Bomvalor — equivalente Python do scraper.php
-
-Roda no GitHub Actions (IPs Azure, normalmente não bloqueados pelo WAF da Martins).
-Gera data/leiloes_bomvalor.json que o site PHP em produção consome via raw.githubusercontent.com.
-
-Dependências: requests, beautifulsoup4, lxml.
-Saída: JSON no stdout (workflow GH Action redireciona pra arquivo + commita).
-"""
-
+"""Scraper Martins Leilões — usa Cloudflare Worker como proxy."""
 from __future__ import annotations
 import json
+import os
 import re
 import sys
 import unicodedata
@@ -22,8 +14,6 @@ from bs4 import BeautifulSoup
 
 FONTE = "https://martinsleiloes.com.br"
 TIMEOUT = 20
-
-import os
 WORKER_URL = os.environ.get("WORKER_URL", "").rstrip("/")
 WORKER_KEY = os.environ.get("WORKER_KEY", "")
 
@@ -39,114 +29,128 @@ CATEGORIA_FALLBACK_IMG = {
 }
 
 
-def is_logo_ou_vazio(src: str) -> bool:
-    if not src:
-        return True
-    s = src.lower()
-    return (
-        "/logo" in s
-        or "tipo-leilao" in s
-        or "/layout/" in s
-        or "logo-header" in s
-        or s.endswith("/logo.png")
-        or s.endswith("/logo.jpg")
-    )
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,*/*;q=0.8",
-    "Accept-Language": "pt-BR,pt;q=0.9",
-}
-
 def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+def is_logo_ou_vazio(src: str) -> bool:
+    if not src:
+        return True
+    s = src.lower()
+    return ("/logo" in s or "tipo-leilao" in s or "/layout/" in s
+            or "logo-header" in s or s.endswith("/logo.png") or s.endswith("/logo.jpg"))
+
+
 def fetch(url: str) -> Optional[str]:
+    """GET via Cloudflare Worker (bypassa WAF da Martins)."""
     if WORKER_URL and WORKER_KEY:
         proxy = f"{WORKER_URL}/?url={requests.utils.quote(url, safe='')}&key={WORKER_KEY}"
         log(f"  → via worker: {url}")
         try:
             r = requests.get(proxy, timeout=30)
             if r.status_code == 200 and r.text:
-                log(f"  ✓ {url} → HTTP 200 ({len(r.text)} bytes) [via worker]")
+                log(f"  ✓ {url} → HTTP 200 ({len(r.text)} bytes) [worker]")
                 return r.text
             log(f"  ✗ {url} → worker HTTP {r.status_code}")
+            return None
         except requests.RequestException as e:
             log(f"  ✗ {url} → worker erro: {e}")
-        return None
+            return None
+    # Fallback direto (provavelmente bloqueado)
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0 Chrome/120"}, timeout=TIMEOUT)
         if r.status_code == 200 and r.text:
-            log(f"  ✓ {url} → HTTP 200 ({len(r.text)} bytes)")
             return r.text
-        log(f"  ✗ {url} → HTTP {r.status_code} (tamanho {len(r.text)} bytes)")
+        log(f"  ✗ {url} → HTTP {r.status_code}")
+        return None
     except requests.RequestException as e:
         log(f"  ✗ {url} → erro: {e}")
-    return None
+        return None
 
 
 def sem_acento(s: str) -> str:
-    nfkd = unicodedata.normalize("NFKD", s)
-    return "".join(c for c in nfkd if not unicodedata.combining(c))
+    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+
 
 def categoria_da_url(href_e_titulo: str) -> str:
     t = sem_acento(href_e_titulo.lower())
-    if "/imoveis/" in t: return "imoveis"
-    if ("imovei" in t or "apartamento" in t or re.search(r"\b(casa|casas)\b", t) or "galpao" in t or "terreno" in t or "hotel-fazenda" in t or "fazenda" in t or "sitio" in t or "chacara" in t): return "imoveis"
-    if "sucata" in t or "residuo" in t or "reciclav" in t: return "sucatas"
-    if "industrial" in t or "usina" in t or "fabrica" in t: return "industrial"
-    if "tecnolog" in t or "eletronic" in t or "informatic" in t or "servidor" in t: return "tecnologia"
-    if "animais" in t or "animal" in t or "gado" in t or "bovino" in t or "equino" in t: return "animais"
-    if ("/bens-diversos/" in t or "maquina" in t or "caminh" in t or "trator" in t or "empilhad" in t or "linha-amarela" in t or "linha amarela" in t or "escavadeira" in t or "retro" in t): return "maquinas"
-    if ("/veiculos/" in t or "veicul" in t or "pajero" in t or "carreta" in t or "randon" in t or "mitsubishi" in t or "fiduciar" in t): return "veiculos"
+    if "/imoveis/" in t:
+        return "imoveis"
+    if any(k in t for k in ("imovei", "apartamento", "galpao", "terreno", "hotel-fazenda", "fazenda", "sitio", "chacara")):
+        return "imoveis"
+    if re.search(r"\b(casa|casas)\b", t):
+        return "imoveis"
+    if any(k in t for k in ("sucata", "residuo", "reciclav")):
+        return "sucatas"
+    if any(k in t for k in ("industrial", "usina", "fabrica")):
+        return "industrial"
+    if any(k in t for k in ("tecnolog", "eletronic", "informatic", "servidor")):
+        return "tecnologia"
+    if any(k in t for k in ("animais", "animal", "gado", "bovino", "equino")):
+        return "animais"
+    if any(k in t for k in ("/bens-diversos/", "maquina", "caminh", "trator", "empilhad",
+                            "linha-amarela", "linha amarela", "escavadeira", "retro")):
+        return "maquinas"
+    if any(k in t for k in ("/veiculos/", "veicul", "pajero", "carreta", "randon",
+                            "mitsubishi", "fiduciar")):
+        return "veiculos"
     return "outros"
+
 
 def slug_from_href(href: str) -> str:
     path = href.split("?")[0].rstrip("/")
     return path.split("/")[-1] or href.replace("/", "-")
+
 
 def rx_int(s: str, pattern: str) -> Optional[int]:
     m = re.search(pattern, s)
     return int(m.group(1)) if m else None
 
 
-def parse_card_generico(card, destaque: bool = False) -> Optional[dict[str, Any]]:
-    href = card.get("href", "")
-    if not href or not href.startswith("/"):
-        return None
-    texto = re.sub(r"\s+", " ", card.get_text(" ", strip=True))
-    id_origem = rx_int(texto, r"ID:\s*(\d+)") or rx_int(href, r"-(\d{4,7})(?:/|$)")
-    if not id_origem:
-        return None
-    # titulo: tenta status-leilao (destaques), depois titulo/card-title, depois h2/h3
-    titulo = ""
-    for q in [{"parn": "class_", "val": "status-leilao"}, {"parn": "class_", "val": re.compile("titulo|card-title")}]:
-        node = card.find(**{"parn": q["val"]})if False else card.find(attrs={"class": q["val"]} if q["parn"] == "class_" else None
-        if node:
-            titulo = node.get_text(strip=True)
-            break
-    if not titulo:
-        node = card.find(["h2", "h3"])
-        if node: titulo = node.get_text(strip=True)
-    if not titulo:
-        titulo = texto[:80]
-    # imagem: primeiro background-image do .carousel-item (destaques), depois <img banner_leilao>
-    img = ""
+def extrair_imagem(card) -> str:
+    """Extrai imagem: prioriza background-image do carrossel, depois <img banner_leilao>."""
     fotos = card.find_all(class_=re.compile(r"carousel-item.*fotos"))
     for f in fotos:
         style = f.get("style", "") or ""
         m = re.search(r"url\(([^)]+)\)", style)
         if m:
-            u = m.group(1).strip().strip("'\"")
-            if "banner_leilao" in u or "/fotos/" in u:
-                img = u
-                break
-    if not img:
-        inode = card.find("img", src=re.compile("banner_leilao")) or card.find("img", src=re.compile(r"/fotos/")) or card.find("img")
-        if inode: img = inode.get("src", "")
+            url = m.group(1).strip().strip("'\"")
+            if "banner_leilao" in url or "/fotos/" in url:
+                return url
+    inode = (card.find("img", src=re.compile("banner_leilao"))
+             or card.find("img", src=re.compile(r"/fotos/"))
+             or card.find("img"))
+    return inode.get("src", "") if inode else ""
 
+
+def extrair_titulo(card, texto: str) -> str:
+    for cls in ("status-leilao", "titulo", "card-title"):
+        node = card.find(class_=cls)
+        if node:
+            t = node.get_text(strip=True)
+            if t:
+                return t
+    h = card.find(["h2", "h3"])
+    if h:
+        return h.get_text(strip=True)
+    return texto[:80]
+
+
+def parse_card(card, destaque: bool) -> Optional[dict[str, Any]]:
+    href = card.get("href", "")
+    if not href or not href.startswith("/"):
+        return None
+
+    texto = re.sub(r"\s+", " ", card.get_text(" ", strip=True))
+
+    id_origem = rx_int(texto, r"ID:\s*(\d+)") or rx_int(href, r"-(\d{4,7})(?:/|$)")
+    if not id_origem:
+        return None
+
+    titulo = extrair_titulo(card, texto)
+    img = extrair_imagem(card)
     categoria = categoria_da_url(titulo + " " + href)
+
     if is_logo_ou_vazio(img):
         img = CATEGORIA_FALLBACK_IMG.get(categoria, "")
 
@@ -160,13 +164,12 @@ def parse_card_generico(card, destaque: bool = False) -> Optional[dict[str, Any]
     m = re.search(r"Encerramento.*?(\d{2}/\d{2}/\d{4})\s*(\d{2}:\d{2})?", texto)
     if m:
         try:
-            dd = datetime.strptime(f"{m.group(1)} {m.group(2) or '18:00'}", "%d/%m/%Y %H:%M")
-            fim_str = dd.strftime("%Y-%m-%d %H:%M:%S")
+            dt = datetime.strptime(f"{m.group(1)} {m.group(2) or '18:00'}", "%d/%m/%Y %H:%M")
+            fim_str = dt.strftime("%Y-%m-%d %H:%M:%S")
         except ValueError:
             pass
 
     lotes_qtd = rx_int(texto, r"(\d+)\s+Lotes?")
-    # inicio 24h atrás pra evitar bug timezone
     agora = datetime.now()
     inicio = (agora - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
     fim_default = (agora + timedelta(days=15)).strftime("%Y-%m-%d %H:%M:%S")
@@ -179,14 +182,18 @@ def parse_card_generico(card, destaque: bool = False) -> Optional[dict[str, Any]
         "subcategoria": "",
         "cidade": "",
         "uf": "",
-        "lance_inicial": 0, "lance_atual": 0, "avaliacao": 0, "desconto": 0,
+        "lance_inicial": 0,
+        "lance_atual": 0,
+        "avaliacao": 0,
+        "desconto": 0,
         "inicio": inicio,
         "fim": fim_str or fim_default,
         "tipo": "judicial" if "judic" in titulo.lower() else "extrajudicial",
         "imagem": img,
         "edital_url": "#",
         "lance_url": FONTE + href,
-        "descricao": f"{titulo}. Leilão conduzido pela Martins Leilões." + (f" {lotes_qtd} lotes disponíveis." if lotes_qtd else ""),
+        "descricao": f"{titulo}. Leilão conduzido pela Martins Leilões." + (
+            f" {lotes_qtd} lotes disponíveis." if lotes_qtd else ""),
         "destaque": destaque,
         "status_origem": status,
         "lotes_qtd": lotes_qtd,
@@ -197,14 +204,15 @@ def parse_card_generico(card, destaque: bool = False) -> Optional[dict[str, Any]
 def coletar_destaques() -> list[dict[str, Any]]:
     log(f"Coletando destaques: {FONTE}/")
     html = fetch(FONTE + "/")
-    if not html: return []
+    if not html:
+        return []
     soup = BeautifulSoup(html, "lxml")
     cards = soup.select(".destaques-row .destaque-item a.leilao-container")
-    log(f"  {len(cards)} cards de destaque encontrados")
-    eventos = []
-    vistos = set()
-    for card in cards:
-        e = parse_card_generico(card, destaque=True)
+    log(f"  {len(cards)} cards de destaque")
+    eventos: list[dict[str, Any]] = []
+    vistos: set[int] = set()
+    for c in cards:
+        e = parse_card(c, destaque=True)
         if e and e["id_origem"] not in vistos:
             eventos.append(e)
             vistos.add(e["id_origem"])
@@ -214,14 +222,15 @@ def coletar_destaques() -> list[dict[str, Any]]:
 def coletar_proximos() -> list[dict[str, Any]]:
     log(f"Coletando próximos leilões: {FONTE}/")
     html = fetch(FONTE + "/")
-    if not html: return []
+    if not html:
+        return []
     soup = BeautifulSoup(html, "lxml")
     cards = soup.find_all("a", class_=lambda c: c and "card-home" in c and "link-leilao" in c)
-    log(f"  {len(cards)} cards 'próximos' encontrados")
-    eventos = []
-    vistos = set()
-    for card in cards:
-        e = parse_card_generico(card, destaque=False)
+    log(f"  {len(cards)} cards 'próximos'")
+    eventos: list[dict[str, Any]] = []
+    vistos: set[int] = set()
+    for c in cards:
+        e = parse_card(c, destaque=False)
         if e and e["id_origem"] not in vistos:
             eventos.append(e)
             vistos.add(e["id_origem"])
@@ -230,16 +239,17 @@ def coletar_proximos() -> list[dict[str, Any]]:
 
 def coletar_categoria(slug: str) -> list[dict[str, Any]]:
     url = f"{FONTE}/busca/categoriaProduto/{slug}"
-    log(f"Coletando categoria '{slug}': {url}")
+    log(f"Coletando categoria '{slug}'")
     html = fetch(url)
-    if not html: return []
+    if not html:
+        return []
     soup = BeautifulSoup(html, "lxml")
-    cards = soup.select("a.leilao-container, a.card-home.link-leilao, a[href^='/leilao-']")
-    log(f"  {len(cards)} cards encontrados")
-    eventos = []
-    vistos = set()
-    for card in cards:
-        e = parse_card_generico(card)
+    cards = soup.select("a.leilao-container, a.card-home.link-leilao")
+    log(f"  {len(cards)} cards")
+    eventos: list[dict[str, Any]] = []
+    vistos: set[int] = set()
+    for c in cards:
+        e = parse_card(c, destaque=False)
         if e and e["id_origem"] not in vistos:
             e["categoria"] = slug
             eventos.append(e)
@@ -279,6 +289,7 @@ def main() -> int:
         log(f"  {c}: {n}")
     print(json.dumps(eventos, indent=2, ensure_ascii=False))
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())
