@@ -1,0 +1,48 @@
+name: Sync Leiloes Bomvalor
+
+# Roda a cada 15 minutos + manualmente via "Run workflow" no painel do GitHub
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+# Permissão pra commit + push no próprio repo
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install deps
+        run: pip install requests beautifulsoup4 lxml
+
+      - name: Run scraper
+        run: |
+          mkdir -p data
+          python scraper.py > data/leiloes_bomvalor.json
+          echo "Tamanho do JSON: $(wc -c < data/leiloes_bomvalor.json) bytes"
+          echo "Quantidade de leilões: $(python -c 'import json; print(len(json.load(open(\"data/leiloes_bomvalor.json\"))))')"
+
+      - name: Commit & push se mudou
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/leiloes_bomvalor.json
+          if git diff --staged --quiet; then
+            echo "Nada mudou no JSON — sem commit."
+          else
+            git commit -m "sync: leiloes atualizados $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
